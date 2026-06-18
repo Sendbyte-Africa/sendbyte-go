@@ -10,7 +10,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestRejectsMalformedKeys(t *testing.T) {
@@ -187,6 +190,175 @@ func TestWebhookEventsUnion(t *testing.T) {
 	}
 	if wh.Secret != "whsec_x" {
 		t.Fatalf("expected secret to survive, got %q", wh.Secret)
+	}
+}
+
+func TestAutoIdempotencyKeyWhenAbsent(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprint(w, `{"id":"em_1"}`)
+	}))
+	defer server.Close()
+
+	client, _ := New("sk_test_abc", WithBaseURL(server.URL))
+	if _, err := client.Emails.Send(context.Background(), SendEmailRequest{From: "a@b.ng", To: []string{"c@d.ng"}, Subject: "Hi", Text: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	key, _ := body["idempotency_key"].(string)
+	uuidRe := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	if !uuidRe.MatchString(key) {
+		t.Fatalf("expected a v4 UUID idempotency key, got %q", key)
+	}
+}
+
+func TestRetries429AndReusesIdempotencyKey(t *testing.T) {
+	var calls int32
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if k, ok := body["idempotency_key"].(string); ok {
+			keys = append(keys, k)
+		}
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, `{"error":{"code":"rate_limited"}}`)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprint(w, `{"id":"em_1"}`)
+	}))
+	defer server.Close()
+
+	client, _ := New("sk_test_abc", WithBaseURL(server.URL))
+	email, err := client.Emails.Send(context.Background(), SendEmailRequest{From: "a@b.ng", To: []string{"c@d.ng"}, Subject: "Hi", Text: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if email.ID != "em_1" {
+		t.Fatalf("expected em_1, got %s", email.ID)
+	}
+	if len(keys) != 2 || keys[0] != keys[1] || keys[0] == "" {
+		t.Fatalf("expected the same non-empty key across both attempts, got %v", keys)
+	}
+}
+
+func TestRetries5xxThenTypedError(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"error":{"code":"unavailable"}}`)
+	}))
+	defer server.Close()
+
+	client, _ := New("sk_test_abc", WithBaseURL(server.URL), WithMaxAttempts(2))
+	_, err := client.Emails.Send(context.Background(), SendEmailRequest{From: "a@b.ng", To: []string{"c@d.ng"}, Subject: "x", Text: "x"})
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Status != 503 {
+		t.Fatalf("expected a 503 *Error, got %v", err)
+	}
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Fatalf("expected 2 attempts, got %d", calls)
+	}
+}
+
+func TestNonJSONErrorBodyTypedError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, "<html><body>502 Bad Gateway</body></html>")
+	}))
+	defer server.Close()
+
+	client, _ := New("sk_test_abc", WithBaseURL(server.URL), WithMaxAttempts(1))
+	_, err := client.Emails.Send(context.Background(), SendEmailRequest{From: "a@b.ng", To: []string{"c@d.ng"}, Subject: "x", Text: "x"})
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "request_failed" || apiErr.Status != 502 {
+		t.Fatalf("expected request_failed/502 *Error, got %v", err)
+	}
+}
+
+func TestAttachmentsAndListUnsubscribeInBody(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprint(w, `{"id":"em_1"}`)
+	}))
+	defer server.Close()
+
+	client, _ := New("sk_test_abc", WithBaseURL(server.URL))
+	_, err := client.Emails.Send(context.Background(), SendEmailRequest{
+		From:            "a@b.ng",
+		To:              []string{"c@d.ng"},
+		Subject:         "Hi",
+		Text:            "x",
+		Attachments:     []Attachment{{Filename: "r.pdf", Content: "Zm9v", ContentType: "application/pdf"}},
+		ListUnsubscribe: &ListUnsubscribe{URL: "https://x.ng/u", Mailto: "unsub@x.ng"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	atts, ok := body["attachments"].([]any)
+	if !ok || len(atts) != 1 {
+		t.Fatalf("expected one attachment in body, got %v", body["attachments"])
+	}
+	att := atts[0].(map[string]any)
+	if att["filename"] != "r.pdf" || att["content_type"] != "application/pdf" {
+		t.Fatalf("attachment fields not serialized as snake_case: %v", att)
+	}
+	unsub, ok := body["list_unsubscribe"].(map[string]any)
+	if !ok || unsub["url"] != "https://x.ng/u" || unsub["mailto"] != "unsub@x.ng" {
+		t.Fatalf("list_unsubscribe not serialized: %v", body["list_unsubscribe"])
+	}
+}
+
+func TestVerifyParsesSESVerified(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"id":"dom_1","domain":"x.ng","status":"pending","ses_verified":false,"checks":[]}`)
+	}))
+	defer server.Close()
+
+	client, _ := New("sk_test_abc", WithBaseURL(server.URL))
+	res, err := client.Domains.Verify(context.Background(), "dom_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.SESVerified == nil || *res.SESVerified != false {
+		t.Fatalf("expected ses_verified=false, got %v", res.SESVerified)
+	}
+}
+
+func TestRefusesLiveKeyOverInsecureBaseURL(t *testing.T) {
+	if _, err := New("sk_live_abc", WithBaseURL("http://api.example.com")); err == nil {
+		t.Fatal("expected an error for a live key over http")
+	}
+	// http tolerated for localhost dev; test keys always allowed.
+	if _, err := New("sk_live_abc", WithBaseURL("http://localhost:8080")); err != nil {
+		t.Fatalf("localhost http should be allowed, got %v", err)
+	}
+	if _, err := New("sk_test_abc", WithBaseURL("http://api.example.com")); err != nil {
+		t.Fatalf("test key over http should be allowed, got %v", err)
+	}
+}
+
+func TestInjectedClientGetsDefaultTimeout(t *testing.T) {
+	injected := &http.Client{} // no Timeout set
+	client, err := New("sk_test_abc", WithHTTPClient(injected))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.httpClient.Timeout != defaultTimeout {
+		t.Fatalf("expected a default timeout on the injected client, got %v", client.httpClient.Timeout)
+	}
+	// An explicit timeout is preserved.
+	withTimeout := &http.Client{Timeout: 5 * time.Second}
+	client2, _ := New("sk_test_abc", WithHTTPClient(withTimeout))
+	if client2.httpClient.Timeout != 5*time.Second {
+		t.Fatalf("expected the caller's timeout to survive, got %v", client2.httpClient.Timeout)
 	}
 }
 

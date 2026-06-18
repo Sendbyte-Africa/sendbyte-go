@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -21,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -29,8 +31,11 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://api.sendbyte.africa"
-	version        = "0.1.0"
+	defaultBaseURL     = "https://api.sendbyte.africa"
+	version            = "0.2.0"
+	defaultTimeout     = 30 * time.Second
+	defaultMaxAttempts = 3
+	maxBackoff         = 20 * time.Second
 	// SignatureHeader carries the webhook HMAC signature.
 	SignatureHeader = "sendbyte-signature"
 )
@@ -50,9 +55,10 @@ func (e *Error) Error() string {
 
 // Client is the SendByte API client.
 type Client struct {
-	apiKey     string
-	baseURL    string
-	httpClient *http.Client
+	apiKey      string
+	baseURL     string
+	httpClient  *http.Client
+	maxAttempts int
 
 	Emails   *EmailsService
 	Domains  *DomainsService
@@ -67,12 +73,38 @@ func WithBaseURL(u string) Option {
 	return func(c *Client) { c.baseURL = strings.TrimRight(u, "/") }
 }
 
-// WithHTTPClient injects a custom *http.Client.
+// WithHTTPClient injects a custom *http.Client. If the injected client has no
+// Timeout, a sane default is applied so a hung connection cannot block forever.
 func WithHTTPClient(h *http.Client) Option {
 	return func(c *Client) { c.httpClient = h }
 }
 
+// WithMaxAttempts caps the total attempts per request, including the first (so
+// 3 means up to 2 retries). Values below 1 are treated as 1.
+func WithMaxAttempts(n int) Option {
+	return func(c *Client) { c.maxAttempts = n }
+}
+
+// isSecureBaseURL reports whether https is in use; http is tolerated only for
+// localhost/loopback dev hosts.
+func isSecureBaseURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	host := u.Hostname()
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
 // New creates a client. The key must start with sk_live_ or sk_test_.
+//
+// Requests retry on 429 and 5xx (and transport errors) with exponential
+// backoff plus jitter, honoring Retry-After, up to the configured attempts.
+// On POST /v1/emails an idempotency key is generated and reused across retries
+// when the caller did not supply one, so a retried send cannot double-send.
 func New(apiKey string, opts ...Option) (*Client, error) {
 	if !strings.HasPrefix(apiKey, "sk_live_") && !strings.HasPrefix(apiKey, "sk_test_") {
 		return nil, &Error{
@@ -81,12 +113,30 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 		}
 	}
 	c := &Client{
-		apiKey:     apiKey,
-		baseURL:    defaultBaseURL,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		apiKey:      apiKey,
+		baseURL:     defaultBaseURL,
+		httpClient:  &http.Client{Timeout: defaultTimeout},
+		maxAttempts: defaultMaxAttempts,
 	}
 	for _, opt := range opts {
 		opt(c)
+	}
+	if c.maxAttempts < 1 {
+		c.maxAttempts = 1
+	}
+	// A live key over a non-https base URL would send the secret in cleartext.
+	if strings.HasPrefix(apiKey, "sk_live_") && !isSecureBaseURL(c.baseURL) {
+		return nil, &Error{
+			Code:    "insecure_base_url",
+			Message: "Refusing to send a live API key (sk_live_) over an insecure base URL. Use https, or a test key for local http.",
+		}
+	}
+	// An injected client with no timeout would let a hung connection block
+	// forever; default a sane timeout onto it.
+	if c.httpClient == nil {
+		c.httpClient = &http.Client{Timeout: defaultTimeout}
+	} else if c.httpClient.Timeout == 0 {
+		c.httpClient.Timeout = defaultTimeout
 	}
 	c.Emails = &EmailsService{c}
 	c.Domains = &DomainsService{c}
@@ -95,68 +145,239 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 }
 
 func (c *Client) request(ctx context.Context, method, path string, body, out any) error {
-	var reader io.Reader
+	// Auto-generate an idempotency key for sends and reuse it across retries so
+	// a retried POST /v1/emails cannot double-send. Body-based, matching the API.
+	if method == http.MethodPost && path == "/v1/emails" {
+		body = withIdempotencyKey(body)
+	}
+
+	var payload []byte
 	if body != nil {
-		payload, err := json.Marshal(body)
+		marshalled, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
-		reader = bytes.NewReader(payload)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("User-Agent", "sendbyte-go/"+version)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		payload = marshalled
 	}
 
-	res, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	data, err := io.ReadAll(res.Body)
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
+		var reader io.Reader
+		if payload != nil {
+			reader = bytes.NewReader(payload)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		req.Header.Set("User-Agent", "sendbyte-go/"+version)
+		if payload != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+
+		res, err := c.httpClient.Do(req)
+		if err != nil {
+			// Transport error (timeout, connection refused): retry if attempts remain.
+			lastErr = err
+			if attempt < c.maxAttempts {
+				if waitErr := sleepCtx(ctx, backoffDelay(attempt, "")); waitErr != nil {
+					return waitErr
+				}
+				continue
+			}
+			return err
+		}
+		data, readErr := io.ReadAll(res.Body)
+		res.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			if attempt < c.maxAttempts {
+				if waitErr := sleepCtx(ctx, backoffDelay(attempt, "")); waitErr != nil {
+					return waitErr
+				}
+				continue
+			}
+			return readErr
+		}
+
+		if res.StatusCode >= 400 {
+			if isRetryableStatus(res.StatusCode) && attempt < c.maxAttempts {
+				lastErr = parseError(data, res.StatusCode)
+				if waitErr := sleepCtx(ctx, backoffDelay(attempt, res.Header.Get("Retry-After"))); waitErr != nil {
+					return waitErr
+				}
+				continue
+			}
+			return parseError(data, res.StatusCode)
+		}
+		if out != nil {
+			return json.Unmarshal(data, out)
+		}
+		return nil
 	}
 
-	if res.StatusCode >= 400 {
-		var wrapper struct {
-			Error Error `json:"error"`
-		}
-		if jsonErr := json.Unmarshal(data, &wrapper); jsonErr != nil || wrapper.Error.Code == "" {
-			return &Error{Code: "request_failed", Message: fmt.Sprintf("request failed with status %d", res.StatusCode), Status: res.StatusCode}
-		}
-		wrapper.Error.Status = res.StatusCode
-		return &wrapper.Error
+	if lastErr != nil {
+		return lastErr
 	}
-	if out != nil {
-		return json.Unmarshal(data, out)
+	return &Error{Code: "request_failed", Message: "request failed after exhausting retries"}
+}
+
+// withIdempotencyKey adds a generated idempotency_key to a send body when the
+// caller did not set one. It works for SendEmailRequest and for a map body.
+func withIdempotencyKey(body any) any {
+	switch b := body.(type) {
+	case SendEmailRequest:
+		if b.IdempotencyKey == "" {
+			b.IdempotencyKey = newIdempotencyKey()
+		}
+		return b
+	case *SendEmailRequest:
+		if b != nil && b.IdempotencyKey == "" {
+			clone := *b
+			clone.IdempotencyKey = newIdempotencyKey()
+			return clone
+		}
+		return b
+	case map[string]any:
+		if _, ok := b["idempotency_key"]; !ok {
+			b["idempotency_key"] = newIdempotencyKey()
+		}
+		return b
+	default:
+		return body
 	}
-	return nil
+}
+
+// newIdempotencyKey returns a random RFC 4122 v4 UUID string.
+func newIdempotencyKey() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Fall back to a timestamp-derived key; collisions are vanishingly
+		// unlikely and a key is still better than none for retry safety.
+		return fmt.Sprintf("sb-%d", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func isRetryableStatus(status int) bool {
+	return status == 429 || (status >= 500 && status < 600)
+}
+
+// parseError turns a non-2xx body into a typed *Error, never failing on a
+// non-JSON body (a gateway/proxy 502/504 may return HTML or plain text).
+func parseError(data []byte, status int) error {
+	var wrapper struct {
+		Error Error `json:"error"`
+	}
+	if jsonErr := json.Unmarshal(data, &wrapper); jsonErr != nil || wrapper.Error.Code == "" {
+		return &Error{Code: "request_failed", Message: fmt.Sprintf("request failed with status %d", status), Status: status}
+	}
+	wrapper.Error.Status = status
+	return &wrapper.Error
+}
+
+// backoffDelay computes exponential backoff with full jitter, capped, honoring
+// Retry-After (delta-seconds or an HTTP-date) when present. attempt is 1-based.
+func backoffDelay(attempt int, retryAfter string) time.Duration {
+	if d, ok := parseRetryAfter(retryAfter); ok {
+		if d > maxBackoff {
+			return maxBackoff
+		}
+		return d
+	}
+	base := 250 * time.Millisecond * (1 << (attempt - 1))
+	if base > maxBackoff {
+		base = maxBackoff
+	}
+	return jitter(base)
+}
+
+func parseRetryAfter(value string) (time.Duration, bool) {
+	if value == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+		if secs < 0 {
+			secs = 0
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		d := time.Until(when)
+		if d < 0 {
+			d = 0
+		}
+		return d, true
+	}
+	return 0, false
+}
+
+func jitter(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(max)))
+	if err != nil {
+		return max
+	}
+	return time.Duration(n.Int64())
+}
+
+// sleepCtx waits for d unless the context is cancelled first.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // ---------------------------------------------------------------- Emails
 
+// Attachment is a file to attach to an email. Content is base64-encoded.
+type Attachment struct {
+	Filename    string `json:"filename"`
+	Content     string `json:"content"`
+	ContentType string `json:"content_type"`
+}
+
+// ListUnsubscribe carries one-click unsubscribe details (RFC 8058). Provide an
+// https URL and/or a mailto. The API emits List-Unsubscribe and, for an https
+// URL, List-Unsubscribe-Post so Gmail and Yahoo render a native unsubscribe.
+// Recommended for bulk mail under the 2024 sender rules; harmless on
+// transactional.
+type ListUnsubscribe struct {
+	URL    string `json:"url,omitempty"`
+	Mailto string `json:"mailto,omitempty"`
+}
+
 // SendEmailRequest is the payload for Emails.Send.
 type SendEmailRequest struct {
-	From           string            `json:"from"`
-	To             []string          `json:"to"`
-	Subject        string            `json:"subject,omitempty"`
-	HTML           string            `json:"html,omitempty"`
-	Text           string            `json:"text,omitempty"`
-	CC             []string          `json:"cc,omitempty"`
-	BCC            []string          `json:"bcc,omitempty"`
-	ReplyTo        []string          `json:"reply_to,omitempty"`
-	Tags           []string          `json:"tags,omitempty"`
-	Headers        map[string]string `json:"headers,omitempty"`
-	ScheduledAt    string            `json:"scheduled_at,omitempty"`
-	TemplateID     string            `json:"template_id,omitempty"`
-	Variables      map[string]any    `json:"variables,omitempty"`
-	IdempotencyKey string            `json:"idempotency_key,omitempty"`
+	From            string            `json:"from"`
+	To              []string          `json:"to"`
+	Subject         string            `json:"subject,omitempty"`
+	HTML            string            `json:"html,omitempty"`
+	Text            string            `json:"text,omitempty"`
+	CC              []string          `json:"cc,omitempty"`
+	BCC             []string          `json:"bcc,omitempty"`
+	ReplyTo         []string          `json:"reply_to,omitempty"`
+	Attachments     []Attachment      `json:"attachments,omitempty"`
+	Tags            []string          `json:"tags,omitempty"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	ListUnsubscribe *ListUnsubscribe  `json:"list_unsubscribe,omitempty"`
+	ScheduledAt     string            `json:"scheduled_at,omitempty"`
+	TemplateID      string            `json:"template_id,omitempty"`
+	Variables       map[string]any    `json:"variables,omitempty"`
+	IdempotencyKey  string            `json:"idempotency_key,omitempty"`
 }
 
 // Email is a summary of an email in the log.
@@ -266,12 +487,15 @@ type Domain struct {
 	CreatedAt    string      `json:"created_at"`
 }
 
-// DomainVerification is the result of a verification check.
+// DomainVerification is the result of a verification check. SESVerified lets
+// callers tell "DNS passed but SES not yet confirmed" (false) from fully
+// verified (true); it is nil when the API does not report it.
 type DomainVerification struct {
-	ID     string `json:"id"`
-	Domain string `json:"domain"`
-	Status string `json:"status"`
-	Checks []struct {
+	ID          string `json:"id"`
+	Domain      string `json:"domain"`
+	Status      string `json:"status"`
+	SESVerified *bool  `json:"ses_verified"`
+	Checks      []struct {
 		Purpose  string `json:"purpose"`
 		Host     string `json:"host"`
 		Required bool   `json:"required"`
