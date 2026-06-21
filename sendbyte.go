@@ -42,28 +42,20 @@ const (
 
 // Error is an error returned by the SendByte API, carrying the documented
 // error shape.
-type Error struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	DocsURL string `json:"docs_url"`
-	Status  int    `json:"-"`
-}
-
-func (e *Error) Error() string {
-	return fmt.Sprintf("sendbyte: %s (%s)", e.Message, e.Code)
-}
 
 // Client is the SendByte API client.
-type Client struct {
-	apiKey      string
-	baseURL     string
-	httpClient  *http.Client
-	maxAttempts int
+type (
+	Client struct {
+		apiKey      string
+		baseURL     string
+		httpClient  *http.Client
+		maxAttempts int
 
-	Emails   *EmailsService
-	Domains  *DomainsService
-	Webhooks *WebhooksService
-}
+		Emails   *EmailsService
+		Domains  *DomainsService
+		Webhooks *WebhooksService
+	}
+)
 
 // Option configures the client.
 type Option func(*Client)
@@ -112,6 +104,17 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 			Message: "API key must start with sk_live_ or sk_test_. Create one in the dashboard under API keys.",
 		}
 	}
+	c, err := newClient(apiKey, opts...)
+	if err != nil {
+		return nil, err
+	}
+	c.Emails = &EmailsService{c}
+	c.Domains = &DomainsService{c}
+	c.Webhooks = &WebhooksService{c}
+	return c, nil
+}
+
+func newClient(apiKey string, opts ...Option) (*Client, error) {
 	c := &Client{
 		apiKey:      apiKey,
 		baseURL:     defaultBaseURL,
@@ -126,10 +129,7 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 	}
 	// A live key over a non-https base URL would send the secret in cleartext.
 	if strings.HasPrefix(apiKey, "sk_live_") && !isSecureBaseURL(c.baseURL) {
-		return nil, &Error{
-			Code:    "insecure_base_url",
-			Message: "Refusing to send a live API key (sk_live_) over an insecure base URL. Use https, or a test key for local http.",
-		}
+		return nil, ErrInsecureURL
 	}
 	// An injected client with no timeout would let a hung connection block
 	// forever; default a sane timeout onto it.
