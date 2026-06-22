@@ -74,7 +74,8 @@ func WithBaseURL(u string) Option {
 }
 
 // WithHTTPClient injects a custom *http.Client. If the injected client has no
-// Timeout, a sane default is applied so a hung connection cannot block forever.
+// Timeout, the SDK applies a sane default on a private copy so a hung connection
+// cannot block forever, without mutating the client you passed in.
 func WithHTTPClient(h *http.Client) Option {
 	return func(c *Client) { c.httpClient = h }
 }
@@ -132,11 +133,14 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 		}
 	}
 	// An injected client with no timeout would let a hung connection block
-	// forever; default a sane timeout onto it.
+	// forever; default a sane timeout. Work on a shallow COPY so we never mutate
+	// the caller's *http.Client, which they may share with other code (#67).
 	if c.httpClient == nil {
 		c.httpClient = &http.Client{Timeout: defaultTimeout}
 	} else if c.httpClient.Timeout == 0 {
-		c.httpClient.Timeout = defaultTimeout
+		cp := *c.httpClient
+		cp.Timeout = defaultTimeout
+		c.httpClient = &cp
 	}
 	c.Emails = &EmailsService{c}
 	c.Domains = &DomainsService{c}
@@ -382,15 +386,18 @@ type SendEmailRequest struct {
 
 // Email is a summary of an email in the log.
 type Email struct {
-	ID          string   `json:"id"`
-	From        string   `json:"from"`
-	To          []string `json:"to"`
-	Subject     string   `json:"subject"`
-	Status      string   `json:"status"`
-	Sandbox     bool     `json:"sandbox"`
-	Tags        []string `json:"tags"`
-	ScheduledAt *string  `json:"scheduled_at"`
-	CreatedAt   string   `json:"created_at"`
+	ID      string   `json:"id"`
+	From    string   `json:"from"`
+	To      []string `json:"to"`
+	Subject string   `json:"subject"`
+	Status  string   `json:"status"`
+	Sandbox bool     `json:"sandbox"`
+	Tags    []string `json:"tags"`
+	// MessageID is the delivered RFC Message-ID once known (nil until sent). Use
+	// it as the threading anchor for In-Reply-To / References on follow-up sends.
+	MessageID   *string `json:"message_id"`
+	ScheduledAt *string `json:"scheduled_at"`
+	CreatedAt   string  `json:"created_at"`
 }
 
 // EmailEvent is one lifecycle event on an email.
@@ -469,8 +476,10 @@ func (s *EmailsService) List(ctx context.Context, params ListEmailsParams) (*Ema
 
 // DNSRecord is one record to publish for domain verification.
 type DNSRecord struct {
-	Type     string `json:"type"`
-	Host     string `json:"host"`
+	Type string `json:"type"`
+	Host string `json:"host"`
+	// Name is the relative name for the DNS provider's Name/Host field (apex = "@").
+	Name     string `json:"name"`
 	Value    string `json:"value"`
 	Purpose  string `json:"purpose"`
 	Required bool   `json:"required"`
@@ -484,18 +493,23 @@ type Domain struct {
 	DKIMSelector *string     `json:"dkim_selector"`
 	DNSRecords   []DNSRecord `json:"dns_records"`
 	VerifiedAt   *string     `json:"verified_at"`
-	CreatedAt    string      `json:"created_at"`
+	// DeliverabilityReady is true once the recommended SPF/DMARC/MAIL FROM records
+	// are also published. Distinct from Status: a verified domain (DKIM only) still
+	// underperforms at Yahoo/Microsoft until this is true.
+	DeliverabilityReady bool   `json:"deliverability_ready"`
+	CreatedAt           string `json:"created_at"`
 }
 
 // DomainVerification is the result of a verification check. SESVerified lets
 // callers tell "DNS passed but SES not yet confirmed" (false) from fully
 // verified (true); it is nil when the API does not report it.
 type DomainVerification struct {
-	ID          string `json:"id"`
-	Domain      string `json:"domain"`
-	Status      string `json:"status"`
-	SESVerified *bool  `json:"ses_verified"`
-	Checks      []struct {
+	ID                  string `json:"id"`
+	Domain              string `json:"domain"`
+	Status              string `json:"status"`
+	SESVerified         *bool  `json:"ses_verified"`
+	DeliverabilityReady bool   `json:"deliverability_ready"`
+	Checks              []struct {
 		Purpose  string `json:"purpose"`
 		Host     string `json:"host"`
 		Required bool   `json:"required"`
@@ -567,12 +581,18 @@ func (e *WebhookEvents) UnmarshalJSON(data []byte) error {
 // WebhookEndpoint is a registered webhook destination. Secret is present
 // only in the Create response; store it then.
 type WebhookEndpoint struct {
-	ID        string        `json:"id"`
-	URL       string        `json:"url"`
-	Events    WebhookEvents `json:"events"`
-	Disabled  bool          `json:"disabled"`
-	CreatedAt string        `json:"created_at"`
-	Secret    string        `json:"secret,omitempty"`
+	ID       string        `json:"id"`
+	URL      string        `json:"url"`
+	Events   WebhookEvents `json:"events"`
+	Disabled bool          `json:"disabled"`
+	// DisabledAt is set when the endpoint was auto-disabled after chronic delivery
+	// failures, else nil.
+	DisabledAt *string `json:"disabled_at"`
+	// ConsecutiveFailures counts failed deliveries in a row (resets to 0 on a
+	// success). Watch it to warn before auto-disable.
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	CreatedAt           string `json:"created_at"`
+	Secret              string `json:"secret,omitempty"`
 }
 
 // WebhookReplay is the result of replaying a past delivery.
