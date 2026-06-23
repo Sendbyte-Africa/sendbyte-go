@@ -40,9 +40,6 @@ const (
 	SignatureHeader = "sendbyte-signature"
 )
 
-// Error is an error returned by the SendByte API, carrying the documented
-// error shape.
-
 // Client is the SendByte API client.
 type (
 	Client struct {
@@ -138,9 +135,6 @@ func newClient(apiKey string, opts ...Option) (*Client, error) {
 	} else if c.httpClient.Timeout == 0 {
 		c.httpClient.Timeout = defaultTimeout
 	}
-	c.Emails = &EmailsService{c}
-	c.Domains = &DomainsService{c}
-	c.Webhooks = &WebhooksService{c}
 	return c, nil
 }
 
