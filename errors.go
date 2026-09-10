@@ -16,7 +16,7 @@ func (e *Error) Error() string {
 }
 
 var (
-	ErrInvalidLiveKey    = &Error{Code: "invalid_api_key", Message: "API key must start with sk_live_ to use the live client, please create one in Dashboard"}
-	ErrInvalidSandboxKey = &Error{Code: "invalid_api_key", Message: "API key must start with sk_test_ to use the sandbox client, please create one in Dashboard"}
-	ErrInsecureURL       = &Error{Code: "insecure_base_url", Message: "Refusing to send a live API key (sk_live_) over an insecure base URL. Use https, or a test key for local http."}
+	ErrInvalidLiveKey    error = &Error{Code: "invalid_api_key", Message: "API key must start with sk_live_ to use the live client, please create one in Dashboard"}
+	ErrInvalidSandboxKey error = &Error{Code: "invalid_api_key", Message: "API key must start with sk_test_ to use the sandbox client, please create one in Dashboard"}
+	ErrInsecureURL       error = &Error{Code: "insecure_base_url", Message: "Refusing to send a live API key (sk_live_) over an insecure base URL. Use https, or a test key for local http."}
 )
