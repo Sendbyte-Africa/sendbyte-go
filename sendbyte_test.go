@@ -333,9 +333,19 @@ func TestVerifyParsesSESVerified(t *testing.T) {
 }
 
 func TestRefusesLiveKeyOverInsecureBaseURL(t *testing.T) {
-	if _, err := New("sk_live_abc", WithBaseURL("http://api.example.com")); err == nil {
+	_, err := New("sk_live_abc", WithBaseURL("http://api.example.com"))
+	if err == nil {
 		t.Fatal("expected an error for a live key over http")
 	}
+
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected error of type %T, got %T", apiErr, err)
+	}
+	if apiErr.Error() != ErrInsecureURL.Error() {
+		t.Fatalf("expected error to be %s, got: %s", ErrInsecureURL, apiErr)
+	}
+
 	// http tolerated for localhost dev; test keys always allowed.
 	if _, err := New("sk_live_abc", WithBaseURL("http://localhost:8080")); err != nil {
 		t.Fatalf("localhost http should be allowed, got %v", err)

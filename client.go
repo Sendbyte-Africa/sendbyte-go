@@ -28,7 +28,6 @@ func NewLiveClient(apiKey string, opts ...Option) (*Client, error) {
 		return nil, ErrInvalidLiveKey
 	}
 	return newClient(apiKey, opts...)
-
 }
 
 // NewEmailService creates a standalone email service.
