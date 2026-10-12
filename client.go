@@ -13,7 +13,7 @@ type (
 	}
 )
 
-// NewSandboxClient create a sandbox client. the key must begin with sk_test_.
+// NewSandboxClient creates a sandbox client. The key must begin with sk_test_.
 func NewSandboxClient(apiKey string, opts ...Option) (*Client, error) {
 	if !strings.HasPrefix(apiKey, "sk_test_") {
 		return nil, ErrInvalidSandboxKey
@@ -22,7 +22,7 @@ func NewSandboxClient(apiKey string, opts ...Option) (*Client, error) {
 	return newClient(apiKey, opts...)
 }
 
-// NewLiveClient creates a live client. the key must begin with sk_live_.
+// NewLiveClient creates a live client. The key must begin with sk_live_.
 func NewLiveClient(apiKey string, opts ...Option) (*Client, error) {
 	if !strings.HasPrefix(apiKey, "sk_live_") {
 		return nil, ErrInvalidLiveKey

@@ -88,6 +88,37 @@ client.Webhooks.Replay(ctx, "evt_123")
 
 An endpoint subscribed to every event reports `endpoint.Events.All == true`; otherwise `endpoint.Events.Events` holds the specific event names.
 
+### Receiving email
+
+Received emails count toward your monthly email quota, the same as sent emails. Spam and virus emails never count. `Enable` confirms that for you.
+
+```go
+on, _ := client.Receiving.Enable(ctx)
+// on.TestHost is a test address host you can mail straight away
+
+setup, _ := client.Receiving.EnableDomain(ctx, domain.ID, "inbound")
+// publish setup.MXRecord at your DNS provider, then:
+client.Receiving.CheckDomain(ctx, domain.ID)
+
+page, _ := client.Received.List(ctx, sendbyte.ListReceivedParams{Status: []string{"delivered", "held"}, Limit: 20})
+email, _ := client.Received.Get(ctx, page.Data[0].ID)
+// email.Text, email.HTML, email.StrippedText, email.Attachments, email.Conversation
+
+client.Received.Reply(ctx, email.ID, sendbyte.ReplyToReceivedRequest{Text: "Thanks, we are on it."})
+client.Emails.Conversation(ctx, "em_123")
+
+client.InboundRoutes.Create(ctx, sendbyte.CreateInboundRouteRequest{
+	DomainID:   domain.ID,
+	MatchType:  "exact",
+	MatchValue: "support",
+	Action:     "forward",
+	ForwardTo:  []string{"team@paylink.ng"},
+})
+client.InboundRoutes.List(ctx, domain.ID)
+```
+
+Every received email also arrives as an `email.received` webhook (`sendbyte.EventEmailReceived`) carrying the whole message; decode its `data` into `sendbyte.EmailReceivedEventData`. `Reply` sets the threading headers and generates an idempotency key when you do not pass one. Guide: https://docs.sendbyte.africa/guides/receiving
+
 ## Verifying webhook signatures
 
 Every webhook request carries a `sendbyte-signature` header. Verify it against the raw request body before trusting the payload.

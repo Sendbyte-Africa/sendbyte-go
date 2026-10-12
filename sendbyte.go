@@ -32,7 +32,7 @@ import (
 
 const (
 	defaultBaseURL     = "https://api.sendbyte.africa"
-	version            = "0.2.0"
+	version            = "0.3.0"
 	defaultTimeout     = 30 * time.Second
 	defaultMaxAttempts = 3
 	maxBackoff         = 20 * time.Second
@@ -41,18 +41,23 @@ const (
 )
 
 // Client is the SendByte API client.
-type (
-	Client struct {
-		apiKey      string
-		baseURL     string
-		httpClient  *http.Client
-		maxAttempts int
+type Client struct {
+	apiKey      string
+	baseURL     string
+	httpClient  *http.Client
+	maxAttempts int
 
-		Emails   *EmailsService
-		Domains  *DomainsService
-		Webhooks *WebhooksService
-	}
-)
+	Emails        *EmailsService
+	Domains       *DomainsService
+	Webhooks      *WebhooksService
+	Brands        *BrandsService
+	Lists         *ListsService
+	Subscribers   *SubscribersService
+	Campaigns     *CampaignsService
+	Receiving     *ReceivingService
+	Received      *ReceivedService
+	InboundRoutes *InboundRoutesService
+}
 
 // Option configures the client.
 type Option func(*Client)
@@ -89,12 +94,8 @@ func isSecureBaseURL(raw string) bool {
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
-// New creates a client. The key must start with sk_live_ or sk_test_.
-//
-// Requests retry on 429 and 5xx (and transport errors) with exponential
-// backoff plus jitter, honoring Retry-After, up to the configured attempts.
-// On POST /v1/emails an idempotency key is generated and reused across retries
-// when the caller did not supply one, so a retried send cannot double-send.
+// New creates a client. The key must start with sk_live_ or sk_test_; requests
+// retry on 429, 5xx and transport errors, and sends carry an idempotency key.
 func New(apiKey string, opts ...Option) (*Client, error) {
 	if !strings.HasPrefix(apiKey, "sk_live_") && !strings.HasPrefix(apiKey, "sk_test_") {
 		return nil, &Error{
@@ -102,14 +103,7 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 			Message: "API key must start with sk_live_ or sk_test_. Create one in the dashboard under API keys.",
 		}
 	}
-	c, err := newClient(apiKey, opts...)
-	if err != nil {
-		return nil, err
-	}
-	c.Emails = &EmailsService{c}
-	c.Domains = &DomainsService{c}
-	c.Webhooks = &WebhooksService{c}
-	return c, nil
+	return newClient(apiKey, opts...)
 }
 
 func newClient(apiKey string, opts ...Option) (*Client, error) {
@@ -125,13 +119,9 @@ func newClient(apiKey string, opts ...Option) (*Client, error) {
 	if c.maxAttempts < 1 {
 		c.maxAttempts = 1
 	}
-	// A live key over a non-https base URL would send the secret in cleartext.
 	if strings.HasPrefix(apiKey, "sk_live_") && !isSecureBaseURL(c.baseURL) {
 		return nil, ErrInsecureURL
 	}
-	// An injected client with no timeout would let a hung connection block
-	// forever; default a sane timeout. Work on a shallow COPY so we never mutate
-	// the caller's *http.Client, which they may share with other code (#67).
 	if c.httpClient == nil {
 		c.httpClient = &http.Client{Timeout: defaultTimeout}
 	} else if c.httpClient.Timeout == 0 {
@@ -139,6 +129,16 @@ func newClient(apiKey string, opts ...Option) (*Client, error) {
 		cp.Timeout = defaultTimeout
 		c.httpClient = &cp
 	}
+	c.Emails = &EmailsService{c}
+	c.Domains = &DomainsService{c}
+	c.Brands = &BrandsService{c}
+	c.Lists = &ListsService{c}
+	c.Subscribers = &SubscribersService{c}
+	c.Campaigns = &CampaignsService{c}
+	c.Webhooks = &WebhooksService{c}
+	c.Receiving = &ReceivingService{c}
+	c.Received = &ReceivedService{c}
+	c.InboundRoutes = &InboundRoutesService{c}
 	return c, nil
 }
 
@@ -342,10 +342,17 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 // ---------------------------------------------------------------- Emails
 
 // Attachment is a file to attach to an email. Content is base64-encoded.
+//
+// Set ContentID to embed the file in the HTML body instead of listing it as a
+// download, and reference it as <img src="cid:VALUE">. A ContentID implies an
+// inline disposition, so Disposition is only needed to force "attachment" for a
+// file that has a Content-ID but should still appear as a download.
 type Attachment struct {
 	Filename    string `json:"filename"`
 	Content     string `json:"content"`
 	ContentType string `json:"content_type"`
+	ContentID   string `json:"content_id,omitempty"`
+	Disposition string `json:"disposition,omitempty"`
 }
 
 // ListUnsubscribe carries one-click unsubscribe details (RFC 8058). Provide an
@@ -509,6 +516,233 @@ type DomainVerification struct {
 		Required bool   `json:"required"`
 		Pass     bool   `json:"pass"`
 	} `json:"checks"`
+}
+
+// --- Marketing ---------------------------------------------------------------
+//
+// Brands hold lists, lists hold subscribers. A subscriber's status belongs to
+// the list rather than to the person, which is why these calls take both ids.
+
+// Brand is a marketing brand: the container lists, campaigns and reports live in.
+type Brand struct {
+	ID            string  `json:"id"`
+	Name          string  `json:"name"`
+	PublicName    string  `json:"public_name"`
+	Description   *string `json:"description"`
+	LogoURL       *string `json:"logo_url"`
+	FromName      *string `json:"from_name"`
+	FromAddress   *string `json:"from_address"`
+	ReplyTo       *string `json:"reply_to"`
+	PostalAddress *string `json:"postal_address"`
+	Timezone      string  `json:"timezone"`
+	CreatedAt     string  `json:"created_at"`
+}
+
+// ListCounts breaks a list down by membership status.
+type ListCounts struct {
+	Subscribed   int `json:"subscribed"`
+	Unconfirmed  int `json:"unconfirmed"`
+	Unsubscribed int `json:"unsubscribed"`
+	Bounced      int `json:"bounced"`
+	Complained   int `json:"complained"`
+}
+
+// SubscriberList is one list inside a brand.
+type SubscriberList struct {
+	ID        string     `json:"id"`
+	Name      string     `json:"name"`
+	OptIn     string     `json:"opt_in"`
+	Counts    ListCounts `json:"counts"`
+	CreatedAt string     `json:"created_at"`
+}
+
+// Subscriber is one person's membership of one list.
+type Subscriber struct {
+	ID         string         `json:"id"`
+	Email      string         `json:"email"`
+	Name       *string        `json:"name"`
+	Attributes map[string]any `json:"attributes"`
+	Status     string         `json:"status"`
+	Source     string         `json:"source"`
+	CreatedAt  string         `json:"created_at"`
+}
+
+// AddSubscriberResult reports what happened, including when nothing did.
+type AddSubscriberResult struct {
+	ID     string `json:"id"`
+	Email  string `json:"email"`
+	Status string `json:"status"`
+	// SkippedReason is set when the person was deliberately left alone: they
+	// previously unsubscribed, bounced, or opted out of the whole brand.
+	SkippedReason *string `json:"skipped_reason"`
+}
+
+// ImportSummary accounts for every row of a batch import.
+type ImportSummary struct {
+	Imported int `json:"imported"`
+	Updated  int `json:"updated"`
+	Invalid  int `json:"invalid"`
+	Skipped  int `json:"skipped"`
+	OverCap  int `json:"overCap"`
+	Rejected []struct {
+		Email  string `json:"email"`
+		Reason string `json:"reason"`
+	} `json:"rejected"`
+}
+
+// BrandsService talks to /v1/brands.
+type BrandsService struct{ c *Client }
+
+func (s *BrandsService) Create(ctx context.Context, name string) (*Brand, error) {
+	var out Brand
+	if err := s.c.request(ctx, http.MethodPost, "/v1/brands", map[string]any{"name": name}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (s *BrandsService) List(ctx context.Context) ([]Brand, error) {
+	var out struct {
+		Data []Brand `json:"data"`
+	}
+	if err := s.c.request(ctx, http.MethodGet, "/v1/brands", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Data, nil
+}
+
+func (s *BrandsService) Get(ctx context.Context, brandID string) (*Brand, error) {
+	var out Brand
+	if err := s.c.request(ctx, http.MethodGet, "/v1/brands/"+brandID, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListsService talks to /v1/brands/{brand}/lists.
+type ListsService struct{ c *Client }
+
+func (s *ListsService) Create(ctx context.Context, brandID, name string) (*SubscriberList, error) {
+	var out SubscriberList
+	path := "/v1/brands/" + brandID + "/lists"
+	if err := s.c.request(ctx, http.MethodPost, path, map[string]any{"name": name}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (s *ListsService) List(ctx context.Context, brandID string) ([]SubscriberList, error) {
+	var out struct {
+		Data []SubscriberList `json:"data"`
+	}
+	if err := s.c.request(ctx, http.MethodGet, "/v1/brands/"+brandID+"/lists", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Data, nil
+}
+
+// SubscribersService talks to /v1/brands/{brand}/lists/{list}/subscribers.
+type SubscribersService struct{ c *Client }
+
+// Add puts someone on a list.
+//
+// On a double opt-in list they land as unconfirmed and are never mailed until
+// they confirm. Anyone who previously unsubscribed or bounced stays off, and
+// the result says so via SkippedReason rather than returning an error: a bulk
+// caller should log it and carry on, not stop.
+func (s *SubscribersService) Add(ctx context.Context, brandID, listID, email string) (*AddSubscriberResult, error) {
+	var out AddSubscriberResult
+	path := "/v1/brands/" + brandID + "/lists/" + listID + "/subscribers"
+	if err := s.c.request(ctx, http.MethodPost, path, map[string]any{"email": email}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (s *SubscribersService) List(ctx context.Context, brandID, listID string) ([]Subscriber, error) {
+	var out struct {
+		Data []Subscriber `json:"data"`
+	}
+	path := "/v1/brands/" + brandID + "/lists/" + listID + "/subscribers"
+	if err := s.c.request(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Data, nil
+}
+
+// Import adds up to 1,000 rows in one call and accounts for every rejection.
+func (s *SubscribersService) Import(ctx context.Context, brandID, listID string, subscribers []map[string]any) (*ImportSummary, error) {
+	var out ImportSummary
+	path := "/v1/brands/" + brandID + "/lists/" + listID + "/import"
+	body := map[string]any{"subscribers": subscribers}
+	if err := s.c.request(ctx, http.MethodPost, path, body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SetStatus changes someone's standing on one list.
+func (s *SubscribersService) SetStatus(ctx context.Context, brandID, listID, subscriberID, status string) error {
+	path := "/v1/brands/" + brandID + "/lists/" + listID + "/subscribers/" + subscriberID
+	return s.c.request(ctx, http.MethodPatch, path, map[string]any{"status": status}, nil)
+}
+
+// Campaign is a marketing send to one or more lists.
+type Campaign struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Subject    string `json:"subject"`
+	From       string `json:"from"`
+	Status     string `json:"status"`
+	Recipients int    `json:"recipients"`
+	Sent       int    `json:"sent"`
+	CreatedAt  string `json:"created_at"`
+}
+
+// SendResult reports what the send froze and started.
+type SendResult struct {
+	ID         string `json:"id"`
+	Status     string `json:"status"`
+	Recipients int    `json:"recipients"`
+}
+
+// CampaignsService talks to /v1/brands/{brand}/campaigns.
+type CampaignsService struct{ c *Client }
+
+func (s *CampaignsService) Create(ctx context.Context, brandID string, body map[string]any) (*Campaign, error) {
+	var out Campaign
+	if err := s.c.request(ctx, http.MethodPost, "/v1/brands/"+brandID+"/campaigns", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (s *CampaignsService) List(ctx context.Context, brandID string) ([]Campaign, error) {
+	var out struct {
+		Data []Campaign `json:"data"`
+	}
+	if err := s.c.request(ctx, http.MethodGet, "/v1/brands/"+brandID+"/campaigns", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Data, nil
+}
+
+// Send freezes the audience and starts sending.
+//
+// The audience is snapshotted at this moment: somebody who joins afterwards is
+// not included, somebody who leaves before their turn is skipped, and a person
+// on two of the chosen lists receives one email.
+func (s *CampaignsService) Send(ctx context.Context, brandID, campaignID string, listIDs []string) (*SendResult, error) {
+	var out SendResult
+	path := "/v1/brands/" + brandID + "/campaigns/" + campaignID + "/send"
+	if err := s.c.request(ctx, http.MethodPost, path, map[string]any{"list_ids": listIDs}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (s *CampaignsService) Cancel(ctx context.Context, brandID, campaignID string) error {
+	return s.c.request(ctx, http.MethodPost, "/v1/brands/"+brandID+"/campaigns/"+campaignID+"/cancel", nil, nil)
 }
 
 // DomainsService talks to /v1/domains.
